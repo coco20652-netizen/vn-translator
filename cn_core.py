@@ -63,6 +63,7 @@ DEFAULT_CONFIG = {
     "font": "",
     "glossary": {},
     "extra_prompt": "",
+    "renpy_from_lang": "auto",
     "prices": DEFAULT_PRICES,
 }
 
@@ -468,8 +469,8 @@ def sources_signature(root):
 # ============================================================== 判断哪些文本要翻
 
 TOKEN_RE = re.compile(r"\[\[|\{\{|\[[^\[\]\n]*\]|\{[^{}\n]*\}")
-LETTER_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u3040-\u30FF]")
-FOREIGN_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0400-\u04FF\u3040-\u30FF]")
+LETTER_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u3040-\u30FF\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
+FOREIGN_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0400-\u04FF\u3040-\u30FF\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 RES_RE = re.compile(
     r"\.(png|jpe?g|webp|gif|bmp|avif|svg|ogg|mp3|wav|opus|flac|ogv|webm|mp4|avi|mkv|"
@@ -672,16 +673,17 @@ def valid_translation(src, dst):
     return False  # 原文标签本来就不规整，只接受顺序完全一样的
 
 
-def need_translate(s):
+def need_translate(s, src_lang=None):
     if not isinstance(s, str):
         return False
     t = s.strip()
     if not t or len(t) > 5000:
         return False
     bare = TOKEN_RE.sub("", t)
-    if not LETTER_RE.search(bare):
+    han_source = src_lang in ("ja", "zh-TW")
+    if not LETTER_RE.search(bare) and not (han_source and CJK_RE.search(bare)):
         return False
-    if CJK_RE.search(bare) and not FOREIGN_RE.search(bare):
+    if not han_source and CJK_RE.search(bare) and not FOREIGN_RE.search(bare):
         return False
     if RES_RE.search(t) or COLOR_RE.match(t):
         return False
@@ -695,12 +697,12 @@ def need_translate(s):
     return True
 
 
-def looks_like_ui_text(s):
+def looks_like_ui_text(s, src_lang=None):
     """代码里的普通字符串（没包在 _() 里）要更严格一点才算界面文字"""
     t = s.strip()
-    if not need_translate(t):
+    if not need_translate(t, src_lang):
         return False
-    if " " not in t and not t[:1].isupper():
+    if " " not in t and not t[:1].isupper() and not re.search(r"[^\x00-\x7f]", t):
         return False  # 小写单词多半是变量名、样式名
     if re.search(r"[=<>]{1}|\(\)|\bdef\b|\breturn\b", t) and " " in t and not re.search(r"[.!?…]$", t):
         if t.count("(") or t.count("="):
@@ -781,7 +783,7 @@ def pycode_source(o):
     return None
 
 
-def extract_texts(root, log=None):
+def extract_texts(root, log=None, src_lang="auto"):
     """读出一个游戏里需要翻的全部文本（按出现顺序去重）"""
     all_objs = []
     errors = 0
@@ -840,6 +842,20 @@ def extract_texts(root, log=None):
             for s in _walk(list(getattr(o, "block", None) or [])):
                 skip_ids.add(id(s))
 
+    # 有假名的日文游戏也要提取纯汉字台词；全是汉字时可以在界面明确选择日语。
+    if src_lang == "auto":
+        visible_text = []
+        for o in all_objs:
+            if id(o) in skip_ids:
+                continue
+            if type(o).__name__ in ("Say", "TranslateSay"):
+                visible_text.append(getattr(o, "what", ""))
+            elif type(o).__name__ == "Menu":
+                visible_text.extend(it[0] for it in (getattr(o, "items", None) or [])
+                                    if isinstance(it, (tuple, list)) and it)
+        src_lang = "ja" if any(isinstance(t, str) and re.search(r"[\u3040-\u30ff]", t)
+                               for t in visible_text) else None
+
     # 角色定义：define r = Character("Rhys") 或 init python 里 r = Character(...)
     who_map = {}
     for o in all_objs:
@@ -879,7 +895,7 @@ def extract_texts(root, log=None):
         s = str(s)
         if s in seen or s in covered_old:
             return
-        if (looks_like_ui_text(s) if strict else need_translate(s)):
+        if (looks_like_ui_text(s, src_lang) if strict else need_translate(s, src_lang)):
             seen.add(s)
             texts.append(s)
 
@@ -921,9 +937,9 @@ def extract_texts(root, log=None):
 
     names = []
     for nm in who_map.values():
-        if nm and nm not in names and not TOKEN_RE.search(nm) and LETTER_RE.search(nm):
+        if nm and nm not in names and not TOKEN_RE.search(nm) and need_translate(nm, src_lang):
             names.append(nm)
-    return {"texts": texts, "default_language": default_lang, "errors": errors,
+    return {"texts": texts, "default_language": default_lang, "source_language": src_lang, "errors": errors,
             "speakers": speakers, "names": names}
 
 
@@ -1027,26 +1043,27 @@ def write_json(path, data, indent=None):
         raise
 
 
-TEXTS_VERSION = 2  # 改了「哪些文本要翻」的规则就加 1，旧的文本缓存会自动重新读一遍
+TEXTS_VERSION = 3  # 改了「哪些文本要翻」的规则就加 1，旧的文本缓存会自动重新读一遍
 
 
-def get_text_info(root, log=None, force=False):
+def get_text_info(root, log=None, force=False, src_lang="auto"):
     """{"texts": [...], "speakers": {原文: 说话人}, "names": [角色名]}"""
     sig = sources_signature(root)
     p = _data_path(root, "texts")
     cached = read_json_soft(p)
     if (not force and isinstance(cached, dict) and cached.get("sig") == sig and "speakers" in cached
-            and cached.get("v") == TEXTS_VERSION):
+            and cached.get("v") == TEXTS_VERSION and cached.get("from_lang") == src_lang):
         return cached
-    res = extract_texts(root, log=log)
+    res = extract_texts(root, log=log, src_lang=src_lang)
     info = {"sig": sig, "v": TEXTS_VERSION, "texts": res["texts"], "default_language": res["default_language"],
-            "speakers": res["speakers"], "names": res["names"]}
+            "speakers": res["speakers"], "names": res["names"], "from_lang": src_lang,
+            "source_language": res["source_language"]}
     write_json(p, info)
     return info
 
 
-def get_texts(root, log=None, force=False):
-    return get_text_info(root, log=log, force=force)["texts"]
+def get_texts(root, log=None, force=False, src_lang="auto"):
+    return get_text_info(root, log=log, force=force, src_lang=src_lang)["texts"]
 
 
 def load_translations(root):
@@ -1135,9 +1152,9 @@ def is_done(t, done):
     return t in done and valid_translation(t, done[t])
 
 
-def game_status(root, log=None):
+def game_status(root, log=None, src_lang="auto"):
     """返回 dict：title, version, total, chars_left, left, installed"""
-    texts = get_texts(root, log=log)
+    texts = get_texts(root, log=log, src_lang=src_lang)
     done = load_translations(root)
     left = [t for t in texts if not is_done(t, done)]
     return {
@@ -1483,6 +1500,7 @@ def parse_reply(text):
 
 def system_prompt(cfg, game_glossary=None):
     p = SYSTEM_PROMPT
+    p += source_language_rule(cfg)
     gl = dict(game_glossary or {})
     gl.update({k: v for k, v in (cfg.get("glossary") or {}).items() if k and v})
     gl = {k: v for k, v in gl.items() if k and v}
@@ -1491,6 +1509,13 @@ def system_prompt(cfg, game_glossary=None):
     if cfg.get("extra_prompt"):
         p += "\n\n额外要求：" + cfg["extra_prompt"]
     return p
+
+
+def source_language_rule(cfg):
+    return {
+        "ja": "\n原文是日语：纯汉字的日文也必须翻成简体中文，不要当作已经是中文（如「開始」→「开始」）。",
+        "zh-TW": "\n原文是繁体中文：必须转成简体中文，不能因为原文是中文就原样返回。",
+    }.get(cfg.get("renpy_from_lang"), "")
 
 
 GLOSSARY_PROMPT = """你是资深游戏本地化译者。用户会发来一个游戏里的角色名/专有名词列表（JSON 数组）。
@@ -1507,7 +1532,7 @@ def ensure_glossary(cfg, root, names, usage, stop, log):
     wait_if_paused(stop)
     c = dict(cfg)
     c["json_mode"] = True
-    msgs = [{"role": "system", "content": GLOSSARY_PROMPT},
+    msgs = [{"role": "system", "content": GLOSSARY_PROMPT + source_language_rule(cfg)},
             {"role": "user", "content": json.dumps(missing, ensure_ascii=False)}]
     try:
         obj = parse_reply(call_with_retry(c, msgs, usage, stop))
@@ -1582,7 +1607,9 @@ def _batches(items, size, max_chars):
 
 def translate_game(cfg, root, usage, stop, log, progress):
     """翻译一个游戏还没翻的文本，边翻边存。返回 (已翻, 总数, 失败数, 这次翻了多少字)"""
-    info = get_text_info(root, log=log)
+    info = get_text_info(root, log=log, src_lang=cfg.get("renpy_from_lang", "auto"))
+    cfg = dict(cfg)
+    cfg["renpy_from_lang"] = info.get("source_language") or cfg.get("renpy_from_lang", "auto")
     texts = info["texts"]
     speakers = info.get("speakers") or {}
     index = {t: i for i, t in enumerate(texts)}
@@ -1939,7 +1966,7 @@ init 999 python:
 
 
 def install_patch(root, cfg, log):
-    texts = get_texts(root, log=log)
+    texts = get_texts(root, log=log, src_lang=cfg.get("renpy_from_lang", "auto"))
     done = load_translations(root)
     m = {t: done[t] for t in texts if t in done and done[t] != t and valid_translation(t, done[t])}
     bad = sum(1 for t in texts if t in done and not valid_translation(t, done[t]))

@@ -6,6 +6,8 @@ on:
   push:
     branches: [main]
     paths-ignore: ["README.md"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -27,6 +29,9 @@ jobs:
         shell: bash
         run: echo "v=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
 
+      - name: 回归测试
+        run: python -m unittest discover -s tests -v
+
       - name: 打包（自带 Python 运行时）
         run: python build_windows.py VNTranslator-windows-x64.zip
 
@@ -36,6 +41,7 @@ jobs:
           path: dist/VNTranslator-windows-x64.zip
 
       - name: 发布到 Releases
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.v }}

@@ -12,9 +12,9 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
-APP = "游戏汉化工具"
+APP = "视觉小说翻译器"
 STAGE = os.path.join(DIST, APP)
-ZIP_NAME = sys.argv[1] if len(sys.argv) > 1 else "GameCNTool-windows-x64.zip"
+ZIP_NAME = sys.argv[1] if len(sys.argv) > 1 else "VNTranslator-windows-x64.zip"
 
 TOOL_FILES = ["cn_core.py", "cn_gui.py", "cn_unity.py", "启动.bat", "README.md"]
 # 运行用不到的标准库部分，删掉省体积

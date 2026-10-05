@@ -85,9 +85,9 @@ class Worker(object):
         for r in roots:
             if self.stop.is_set():
                 break
-            self.post("status", r, self.status_of(r))
+            self.post("status", r, self.status_of(r, cfg))
 
-    def status_of(self, r):
+    def status_of(self, r, cfg=None):
         kind = core.game_kind(r) if os.path.isdir(r) else None
         if kind == "unity":
             try:
@@ -97,7 +97,7 @@ class Worker(object):
         if kind != "renpy":
             return {"error": "找不到这个游戏了（被移动或删除）"}
         try:
-            st = core.game_status(r)
+            st = core.game_status(r, src_lang=(cfg or {}).get("renpy_from_lang", "auto"))
         except core.DataFileError as e:
             self.log("%s：%s" % (os.path.basename(r), e))
             return {"error": "翻译记录文件坏了，详情看下面日志"}
@@ -125,12 +125,12 @@ class Worker(object):
                 self._install_unity(r, cfg)
             elif kind == "renpy":
                 ok = self._translate_renpy(r, title, cfg)
-                self.post("status", r, self.status_of(r))
+                self.post("status", r, self.status_of(r, cfg))
                 if not ok:
                     break
             else:
                 self.log("  找不到这个游戏了，跳过")
-            self.post("status", r, self.status_of(r))
+            self.post("status", r, self.status_of(r, cfg))
         for r in roots:
             self.post("live", r, None)
         self.log("")
@@ -224,7 +224,7 @@ class Worker(object):
                     self.log("%s：%s" % (core.game_title(r), "已还原成原版（翻译记录还留着，以后再装不用重新花钱）" if ok else "本来就没装中文补丁"))
             except Exception as e:
                 self.log("%s：还原失败：%s" % (name, e))
-            self.post("status", r, self.status_of(r))
+            self.post("status", r, self.status_of(r, cfg))
 
     def delete(self, roots, model, cfg, service):
         total = 0
@@ -247,7 +247,7 @@ class Worker(object):
                 total += n
             except Exception as e:
                 self.log("%s：删除失败：%s" % (os.path.basename(r), e))
-            self.post("status", r, self.status_of(r))
+            self.post("status", r, self.status_of(r, cfg))
         self.log("一共删掉 %d 条译文。这些句子现在显示原文，想重翻就勾上游戏点「翻译勾选的游戏」。" % total)
 
 
@@ -348,7 +348,7 @@ def run_gui():
             cfg["font"] = os.path.normpath(p)
             v_font.set(os.path.basename(p))
             core.save_config(cfg)
-            append_log("字体换成了 %s。已汉化的 Ren'Py 游戏再点一次「翻译勾选的游戏」就会换上（不花钱）。Unity 游戏用不了字体文件，会继续用微软雅黑。" % os.path.basename(p))
+            append_log("字体换成了 %s。已汉化的 Ren'Py 游戏再点一次「翻译勾选的游戏」就会换上（不花钱）。Unity 普通文字使用系统字体，TextMeshPro 可另外选择专用字体包。" % os.path.basename(p))
 
     ttk.Button(box, text="选字体文件…", command=pick_font_file).grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
@@ -371,8 +371,40 @@ def run_gui():
     ttk.Combobox(uopt, textvariable=v_ulang, values=[n for n, c in unity.FROM_LANGS], state="readonly", width=14).pack(side="left", padx=(4, 12))
     ttk.Checkbutton(uopt, text="Unity 强制换字体（出现方块时勾）", variable=v_uforce).pack(side="left")
 
+    renpy_langs = [("自动识别", "auto")] + unity.FROM_LANGS
+    v_rlang = tk.StringVar(value=next((n for n, c in renpy_langs if c == cfg.get("renpy_from_lang", "auto")), "自动识别"))
+    ttk.Label(box, text="Ren'Py 原文").grid(row=3, column=0, sticky="w", pady=(8, 0))
+    cb_rlang = ttk.Combobox(box, textvariable=v_rlang, values=[n for n, c in renpy_langs], state="readonly", width=24)
+    cb_rlang.grid(row=3, column=1, sticky="w", padx=(4, 16), pady=(8, 0))
+
+    def pick_tmp_font():
+        p = filedialog.askopenfilename(title="选择与游戏版本匹配的中文 TMP 字体资产包（不是 ttf/ttc）",
+                                      filetypes=[("TMP 资产包", "*.bundle *.assetbundle"), ("所有文件", "*.*")])
+        if p:
+            try:
+                with open(p, "rb") as f:
+                    head = f.read(8)
+            except OSError as e:
+                messagebox.showerror("字体包读不了", str(e))
+                return
+            if not head.startswith((b"UnityFS", b"UnityRaw", b"UnityWeb")):
+                messagebox.showwarning("不是 Unity 字体资产包", "请选专门制作的 TMP 字体资产包，系统 ttf/ttc 字体不能用于旧版 TextMeshPro。")
+                return
+            cfg["unity_tmp_font"] = os.path.normpath(p)
+            core.save_config(cfg)
+            append_log("已选择 TMP 字体包：%s。需要与游戏的 Unity/TMP 版本匹配；下次安装或从工具启动游戏时生效。" % os.path.basename(p))
+
+    def clear_tmp_font():
+        cfg.pop("unity_tmp_font", None)
+        core.save_config(cfg)
+        append_log("已取消自选 TMP 字体包。下次启动时会恢复安装前的 TMP 字体设置。")
+
+    ttk.Button(box, text="选 TMP 字体包…", command=pick_tmp_font).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
+    ttk.Button(box, text="取消 TMP 字体包", command=clear_tmp_font).grid(row=3, column=4, sticky="w", pady=(8, 0))
+    ttk.Label(box, text="旧版 TextMeshPro 显示方块时使用专用字体包", foreground="#555").grid(row=3, column=5, columnspan=2, sticky="w", pady=(8, 0))
+
     lbl_price = ttk.Label(box, text="", foreground="#555")
-    lbl_price.grid(row=3, column=0, columnspan=7, sticky="w", pady=(8, 0))
+    lbl_price.grid(row=4, column=0, columnspan=7, sticky="w", pady=(8, 0))
     box.columnconfigure(6, weight=1)
 
     def current_cfg():
@@ -385,6 +417,7 @@ def run_gui():
         c["context"] = bool(v_ctx.get())
         c["game_fullscreen"] = bool(v_full.get())
         c["unity_from_lang"] = lang_codes.get(v_ulang.get(), "en")
+        c["renpy_from_lang"] = dict(renpy_langs).get(v_rlang.get(), "auto")
         c["unity_force_font"] = bool(v_uforce.get())
         return c
 
@@ -504,7 +537,7 @@ def run_gui():
     def _under(g, folder):
         if not folder:
             return True
-        return _key(g).startswith(_key(folder).rstrip("\\/") + os.sep)
+        return _key(g) == _key(folder) or _key(g).startswith(_key(folder).rstrip("\\/") + os.sep)
 
     def visible():
         """列表只显示当前选中的那个文件夹（包括它所有子文件夹）里的游戏"""
@@ -696,6 +729,8 @@ def run_gui():
         set_busy(True)
         worker.start(worker.refresh, roots, collect_cfg())
 
+    cb_rlang.bind("<<ComboboxSelected>>", lambda e: start_refresh())
+
     def run_translate(sel):
         c = collect_cfg()
         if not c["api_key"]:
@@ -885,7 +920,11 @@ def run_gui():
                 if not service_ok[0]:
                     append_log("注意：翻译服务没启动成功，Unity 游戏里的新文字不会翻。")
                 service.set_game(st.get("title") or os.path.basename(g))
-                unity.write_config(g, cfg)  # 字体、原文语言这些设置改过的话同步进去
+                try:
+                    unity.write_config(g, cfg)  # 字体、原文语言这些设置改过的话同步进去
+                except Exception as e:
+                    append_log("%s：同步翻译设置失败（%s），先检查字体包路径和游戏文件夹权限。" % (os.path.basename(g), e))
+                    return
             if full:
                 args = ["-screen-fullscreen", "1"]  # Unity 自带的启动参数
         elif kind == "renpy":

@@ -1,0 +1,37 @@
+name: Windows 版打包
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: 打包（自带 Python 运行时）
+        run: python build_windows.py GameCNTool-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameCNTool-windows-x64
+          path: dist/GameCNTool-windows-x64.zip
+
+      - name: 发布到 Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/GameCNTool-windows-x64.zip
+          body: |
+            下载 GameCNTool-windows-x64.zip，解压后双击「启动.bat」。
+            自带 Python 运行时，不用另外安装。首次打开在设置里填自己的 API key。

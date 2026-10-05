@@ -1,8 +1,11 @@
 name: Windows 版打包
 
+# 推到 main 就自动打包，按 VERSION 文件里的版本号发布到 Releases
+# （同一个版本号再推会覆盖那个版本的下载包；要发新版就改 VERSION）
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths-ignore: ["README.md"]
   workflow_dispatch:
 
 permissions:
@@ -19,6 +22,11 @@ jobs:
           python-version: "3.12"
           architecture: x64
 
+      - name: 读版本号
+        id: ver
+        shell: bash
+        run: echo "v=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: 打包（自带 Python 运行时）
         run: python build_windows.py VNTranslator-windows-x64.zip
 
@@ -28,10 +36,14 @@ jobs:
           path: dist/VNTranslator-windows-x64.zip
 
       - name: 发布到 Releases
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.v }}
+          target_commitish: ${{ github.sha }}
+          name: 视觉小说翻译器 v${{ steps.ver.outputs.v }}
+          make_latest: true
           files: dist/VNTranslator-windows-x64.zip
           body: |
             下载 VNTranslator-windows-x64.zip，解压后双击「启动.bat」。
             自带 Python 运行时，不用另外安装。首次打开在「设置」里填 DeepSeek API key。
+            目前只翻成简体中文。

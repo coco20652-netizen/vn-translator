@@ -24,11 +24,12 @@ class PipelineTests(unittest.TestCase):
         self.logs = []
         self.progress = []
         self.texts = ['Line %d' % i for i in range(12)]
+        self.speakers = {}
         for obj, name, value in (
             (core, 'DATA_DIR', str(self.data)),
             (core, 'GAMES_PATH', str(self.root / 'games.json')),
             (core, 'get_text_info', lambda *a, **k: {
-                'texts': self.texts, 'names': [], 'speakers': {}, 'source_language': 'en'}),
+                'texts': self.texts, 'names': [], 'speakers': self.speakers, 'source_language': 'en'}),
         ):
             p = patch.object(obj, name, value)
             p.start()
@@ -49,7 +50,7 @@ class PipelineTests(unittest.TestCase):
             waited_sizes.append(len(futures))
             return real_wait(futures, **kwargs)
 
-        def batch(cfg, sp, texts, usage, stop, ctx, speakers):
+        def batch(cfg, sp, texts, usage, stop, ctx, speakers, after=None):
             contexts[texts[0]] = ctx
             return {t: '译文' + t[-1] for t in texts}
 
@@ -184,6 +185,35 @@ class PipelineTests(unittest.TestCase):
                 self.assertTrue(stored.wait(5))
         self.assertEqual(core.load_translations(str(self.root)), {'Line 0': '迟到的结果'})
 
+    def test_copied_source_reply_is_rejected_and_retried(self):
+        self.texts = ['I really need to go now.']
+        self.cfg.update(context=False)
+        replies = iter(['I really need to go now.', '我真的得走了。'])
+
+        def api(cfg, messages, usage):
+            payload = json.loads(messages[1]['content'])
+            return json.dumps({k: next(replies) for k in payload})
+
+        with patch.object(core, 'call_api', side_effect=api) as call:
+            self.assertEqual(self.translate()[:3], (1, 1, 0))
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(core.load_translations(str(self.root)), {self.texts[0]: '我真的得走了。'})
+
+    def test_context_skips_ui_text_and_adds_following_lines(self):
+        self.texts = ['Hi there.', 'Settings', 'Bye now.', 'Target line.', 'Next line.', 'Quit', 'Last line.']
+        self.speakers = {t: 'Amy' for t in self.texts if t not in ('Settings', 'Quit')}
+        seen = {}
+
+        def batch(cfg, sp, texts, usage, stop, ctx, speakers, after=None):
+            seen[texts[0]] = (ctx, after)
+            return {t: '译文' for t in texts}
+
+        with patch.object(core, 'translate_batch', side_effect=batch):
+            self.translate()
+        ctx, after = seen['Target line.']
+        self.assertEqual(ctx, ['Amy：Hi there.  →  译文', 'Amy：Bye now.  →  译文'])
+        self.assertEqual(after, ['Amy：Next line.', 'Amy：Last line.'])
+
     def test_game_list_survives_failed_atomic_replace(self):
         core.save_games(['original'])
         with patch.object(core.os, 'replace', side_effect=PermissionError('locked')):
@@ -191,6 +221,79 @@ class PipelineTests(unittest.TestCase):
                 core.save_games(['new'])
         self.assertEqual(core.load_games(), ['original'])
         self.assertEqual(list(self.root.glob('games.json.*.tmp')), [])
+
+
+class QualityTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        p = patch.object(core, 'DATA_DIR', str(self.root / 'data'))
+        p.start()
+        self.addCleanup(p.stop)
+        self.cfg = copy.deepcopy(core.DEFAULT_CONFIG)
+        self.cfg['api_key'] = 'offline-test'
+        self.stop = threading.Event()
+
+    def test_untranslated_detection(self):
+        self.assertTrue(core.looks_untranslated('I really need to go.', 'I really need to go.'))
+        self.assertTrue(core.looks_untranslated('おはよう、先輩', 'おはよう，学长'))
+        self.assertTrue(core.looks_untranslated('안녕하세요', '안녕하세요'))
+        self.assertFalse(core.looks_untranslated('Steam', 'Steam'))
+        self.assertFalse(core.looks_untranslated('Hello [mc]!', '你好，[mc]！'))
+        self.assertFalse(core.looks_untranslated('John Smith', '约翰・史密斯'))
+        self.assertFalse(core.looks_untranslated('bg hall empty', 'bg hall empty'))
+        self.assertFalse(core.looks_untranslated('Bite Your Tongue 2026', 'Bite Your Tongue 2026'))
+        shader = 'uniform sampler2D tex0; uniform float u_bend;'
+        self.assertFalse(core.looks_untranslated(shader, shader))
+        self.assertFalse(core.is_done('I really need to go.', {'I really need to go.': 'I really need to go.'}))
+
+    def test_batch_drops_copied_lines_and_sends_following_context(self):
+        sent = []
+
+        def api(cfg, messages, usage, stop):
+            sent.append(messages[1]['content'])
+            return json.dumps({'1': 'Where are you going now?', '2': '你好'})
+
+        with patch.object(core, 'call_with_retry', side_effect=api):
+            out = core.translate_batch(self.cfg, 'sp', ['Where are you going now?', 'Hello'], core.Usage(),
+                                       self.stop, ['Amy：Hi'], None, ['Bob：Later'])
+        self.assertEqual(out, {'Hello': '你好'})
+        self.assertIn('后文', sent[0])
+        self.assertIn('Bob：Later', sent[0])
+
+    def test_menu_choices_are_marked(self):
+        Menu = core._fake_class('renpy.ast', 'Menu')
+        node = Menu()
+        node.items = [('Go left', 'True', None), ('Stay here', 'True', None)]
+        with patch.object(core, 'script_sources', return_value=[('test.rpyc', lambda: b'')]), \
+                patch.object(core, 'rpyc_statements', return_value=[node]):
+            info = core.extract_texts(str(self.root))
+        self.assertEqual(info['texts'], ['Go left', 'Stay here'])
+        self.assertEqual(info['speakers']['Go left'], core.MENU_SPEAKER)
+        self.assertIn(core.MENU_SPEAKER, core.system_prompt(self.cfg))
+
+    def test_recurring_proper_nouns_are_found(self):
+        texts = ['We met at Ravenwood today.', 'I went to Ravenwood again.', 'Back at Ravenwood, it rained.',
+                 'and Jake ran', 'so Jake ran', 'then Jake ran',
+                 'then Hope said', 'and Hope said', 'so Hope said', 'I hope so.',
+                 'see you on Monday', 'later on Monday', 'early on Monday',
+                 'made with Ren\'Py', 'built in Ren\'Py', 'runs on Ren\'Py']
+        terms = core.find_terms(texts, names=['Jake'])
+        self.assertEqual(terms, ['Ravenwood'])
+
+    def test_glossary_terms_saved_and_rejected_terms_not_asked_again(self):
+        def api(cfg, messages, usage, stop):
+            self.assertIn('候选词', messages[1]['content'])
+            return json.dumps({'Jake': '杰克', 'Ravenwood': '渡鸦林', 'Wow': None})
+
+        with patch.object(core, 'call_with_retry', side_effect=api) as call:
+            gl = core.ensure_glossary(self.cfg, str(self.root), ['Jake'], core.Usage(), self.stop,
+                                      lambda m: None, terms=['Ravenwood', 'Wow'])
+            self.assertEqual(gl, {'Jake': '杰克', 'Ravenwood': '渡鸦林'})
+            core.ensure_glossary(self.cfg, str(self.root), ['Jake'], core.Usage(), self.stop,
+                                 lambda m: None, terms=['Ravenwood', 'Wow'])
+        self.assertEqual(call.call_count, 1)
 
 
 class ApiTests(unittest.TestCase):

@@ -126,8 +126,7 @@ def load_games():
 
 
 def save_games(paths):
-    with open(GAMES_PATH, "w", encoding="utf-8") as f:
-        json.dump(paths, f, ensure_ascii=False, indent=2)
+    write_json(GAMES_PATH, paths, indent=2)
 
 
 # ============================================================== 找游戏
@@ -1351,6 +1350,11 @@ class ApiResponseError(RuntimeError):
     pass
 
 
+class ApiRequestError(RuntimeError):
+    """请求参数或接口不受支持，拆小批次也不会解决。"""
+    pass
+
+
 def _ssl_context():
     try:
         import certifi
@@ -1417,7 +1421,10 @@ def call_api(cfg, messages, usage):
     if url.lower().startswith("https"):
         kw["context"] = SSL_CTX
     with urllib.request.urlopen(req, **kw) as r:
-        resp = json.loads(r.read().decode("utf-8"))
+        try:
+            resp = json.loads(r.read().decode("utf-8"))
+        except (ValueError, UnicodeError) as e:
+            raise ApiResponseError("接口没有返回有效的 UTF-8 JSON，请检查接口地址和服务状态") from e
     if not isinstance(resp, dict):
         raise ApiResponseError("接口返回的不是 JSON 对象：%s" % str(resp)[:200])
     usage.add(cfg, resp.get("usage"))  # 到这一步已经计费了，先记上
@@ -1466,7 +1473,11 @@ def call_with_retry(cfg, messages, usage, stop, tries=4):
             if e.code == 400 and "model" in low and not re.search(r"context|length|token", low):
                 raise AuthError("模型名不对（HTTP 400）%s" % detail)
             if e.code in (400, 413, 422):
-                raise RuntimeError("HTTP %d %s" % (e.code, detail))
+                if e.code == 413 or re.search(r"context|length|token|too (?:large|long)", low):
+                    raise RuntimeError("HTTP %d %s" % (e.code, detail))
+                raise ApiRequestError("HTTP %d %s" % (e.code, detail))
+            if e.code != 429 and not 500 <= e.code < 600:
+                raise ApiRequestError("HTTP %d %s" % (e.code, detail))
             last = "HTTP %d %s" % (e.code, detail)
             if e.code == 429:
                 try:
@@ -1536,7 +1547,7 @@ def ensure_glossary(cfg, root, names, usage, stop, log):
             {"role": "user", "content": json.dumps(missing, ensure_ascii=False)}]
     try:
         obj = parse_reply(call_with_retry(c, msgs, usage, stop))
-    except (AuthError, StopRequested, ApiResponseError):
+    except (AuthError, StopRequested, ApiResponseError, ApiRequestError):
         raise
     except Exception as e:
         log("  定角色译名失败（%s），这次先不用名词表" % str(e)[:80])
@@ -1706,7 +1717,8 @@ def translate_game(cfg, root, usage, stop, log, progress):
         failed = []
         if not items:
             return failed
-        ex = ThreadPoolExecutor(max_workers=max(1, int(cfg.get("threads", 4))))
+        workers = max(1, int(cfg.get("threads", 4)))
+        ex = ThreadPoolExecutor(max_workers=workers)
 
         def job(b, ctx):
             while not send_ok.wait(0.2):
@@ -1722,13 +1734,19 @@ def translate_game(cfg, root, usage, stop, log, progress):
             with _INFLIGHT_LOCK:
                 INFLIGHT_TEXTS.difference_update((gid, t) for t in b)
 
+        # 只保留正在处理的批次。下一批等结果存好后再提交，语境也在这时生成。
+        # 大游戏不会创建成千上万个 Future，停止/接口拒绝后也没有长队继续发请求。
         futs = {}
-        for b in _batches(items, size, max_chars):
-            futs[ex.submit(job, b, context_for(b))] = b
-        pending = set(futs)
-        processed = set()
+        batches = iter(_batches(items, size, max_chars))
 
-        def late(fut):
+        def submit_next():
+            if stop.is_set():
+                return
+            b = next(batches, None)
+            if b is not None:
+                futs[ex.submit(job, b, context_for(b))] = b
+
+        def late(fut, b):
             # 停止后才回来的请求：结果照样存下来，不浪费（存不进去的留在内存里，下次开始前补存）
             try:
                 if not fut.cancelled() and fut.exception() is None:
@@ -1736,21 +1754,22 @@ def translate_game(cfg, root, usage, stop, log, progress):
             except Exception:
                 pass
             finally:
-                release(futs[fut])
+                release(b)
 
         try:
-            while pending:
+            for _ in range(workers):
+                submit_next()
+            while futs:
                 if stop.is_set():
                     raise StopRequested()
-                finished, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                finished, _ = wait(futs, timeout=0.3, return_when=FIRST_COMPLETED)
                 fatal = None
                 for fut in finished:
-                    processed.add(fut)
-                    b = futs[fut]
+                    b = futs.pop(fut)
                     try:
                         try:
                             res = fut.result()
-                        except (AuthError, StopRequested, ApiResponseError) as e:
+                        except (AuthError, StopRequested, ApiResponseError, ApiRequestError) as e:
                             # 返回格式不对：拆小批次、逐句再试也只会一样，多试就是多花钱，直接停
                             fatal = fatal or e
                             continue
@@ -1766,15 +1785,15 @@ def translate_game(cfg, root, usage, stop, log, progress):
                     progress(state["n"], total)
                 if fatal is not None:
                     raise fatal
+                for _ in finished:
+                    submit_next()
         except BaseException:
             # 不管是停止、key 不对，还是写盘失败：排队的请求全部取消，不再花钱；
             # 已经发出去的回来后照样存（同一轮里已回来、还没处理的也一样）
             stop.set()
-            for f in futs:
-                if f in processed:
-                    continue
+            for f, b in list(futs.items()):
                 if not f.cancel():
-                    f.add_done_callback(late)
+                    f.add_done_callback(lambda fut, batch=b: late(fut, batch))
             ex.shutdown(wait=False)
             raise
         ex.shutdown(wait=True)

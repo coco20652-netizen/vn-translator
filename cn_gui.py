@@ -171,6 +171,11 @@ class Worker(object):
             self.post("error", "接口返回的格式不对，已停下：\n%s\n\n多半是接口地址填错了，或者服务商那边出问题。已翻好的部分都保存了。" % e)
             self.stop.set()
             keep_going = False
+        except core.ApiRequestError as e:
+            self.log("  接口不接受当前请求，已停止：%s" % e)
+            self.post("error", "接口不接受当前请求：\n%s\n\n检查接口地址、模型和请求参数后再重启任务。已翻好的部分都保存了。" % e)
+            self.stop.set()
+            keep_going = False
         except core.SaveError as e:
             self.log("  %s。已经停下，没再发新请求。" % e)
             self.post("error", "%s\n\n已经停下，没再发新请求。已经翻回来的结果留在工具里（别关工具），"

@@ -126,8 +126,7 @@ def load_games():
 
 
 def save_games(paths):
-    with open(GAMES_PATH, "w", encoding="utf-8") as f:
-        json.dump(paths, f, ensure_ascii=False, indent=2)
+    write_json(GAMES_PATH, paths, indent=2)
 
 
 # ============================================================== 找游戏
@@ -472,6 +471,10 @@ TOKEN_RE = re.compile(r"\[\[|\{\{|\[[^\[\]\n]*\]|\{[^{}\n]*\}")
 LETTER_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u3040-\u30FF\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 FOREIGN_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u0400-\u04FF\u3040-\u30FF\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# \u8bd1\u6587\u91cc\u8fd8\u7559\u7740\u8fd9\u4e9b\u5b57\uff0c\u8bf4\u660e\u8fd9\u53e5\u6ca1\u7ffb\u51fa\u6765\uff08\u4e2d\u6587\u8bd1\u540d\u5e38\u7528\u7684\u300c\u30fb\u300d\u300c\u30fc\u300d\u4e0d\u7b97\uff09
+KANA_RE = re.compile(r"[\u3041-\u3096\u30a1-\u30fa]")
+HANGUL_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+WORD_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u0400-\u04ff]{2,}")
 RES_RE = re.compile(
     r"\.(png|jpe?g|webp|gif|bmp|avif|svg|ogg|mp3|wav|opus|flac|ogv|webm|mp4|avi|mkv|"
     r"ttf|otf|ttc|woff2?|rpyc?|rpym|rpa|json|txt|py|moc3|model3|exp3|motion3|cdi3|cur|ico)$",
@@ -673,6 +676,24 @@ def valid_translation(src, dst):
     return False  # 原文标签本来就不规整，只接受顺序完全一样的
 
 
+def looks_untranslated(src, dst):
+    """模型偷懒没翻：日文假名、韩文还留在译文里，或者三个词以上、带标点的外文句子原样返回。
+    这种结果不收，拆小批次再翻。单个词、品牌名、标题、图片名（bg hall empty）原样返回是正常的，不算"""
+    if not isinstance(dst, str):
+        return False
+    s = TOKEN_RE.sub("", src).strip()
+    d = TOKEN_RE.sub("", dst).strip()
+    if KANA_RE.search(s) and KANA_RE.search(d):
+        return True
+    if HANGUL_RE.search(s) and HANGUL_RE.search(d):
+        return True
+    if d != s or CJK_RE.search(d) or len(WORD_RE.findall(s)) < 3:
+        return False
+    if ";" in s and re.search(r"[A-Za-z0-9]_[A-Za-z0-9]|[=()]", s):
+        return False  # 着色器 / 代码片段，原样返回是对的
+    return re.search(r"[.,!?;:…]", s) is not None
+
+
 def need_translate(s, src_lang=None):
     if not isinstance(s, str):
         return False
@@ -711,6 +732,7 @@ def looks_like_ui_text(s, src_lang=None):
 
 
 _WRAP_NAMES = {"_", "__", "_p", "renpy.notify", "Notify"}
+MENU_SPEAKER = "（选项）"  # 「说话人」里用它标出玩家可点的选项
 
 
 def code_literals(src):
@@ -918,6 +940,8 @@ def extract_texts(root, log=None, src_lang="auto"):
             for it in getattr(o, "items", None) or []:
                 if isinstance(it, (tuple, list)) and it and isinstance(it[0], str):
                     add(it[0])
+                    if it[0] in seen:
+                        speakers.setdefault(str(it[0]), MENU_SPEAKER)  # 告诉模型这是选项，译得简短
         elif cn == "TranslateString":
             lg = lang(o)
             if lg is None:
@@ -1043,7 +1067,7 @@ def write_json(path, data, indent=None):
         raise
 
 
-TEXTS_VERSION = 3  # 改了「哪些文本要翻」的规则就加 1，旧的文本缓存会自动重新读一遍
+TEXTS_VERSION = 4  # 改了「哪些文本要翻」的规则就加 1，旧的文本缓存会自动重新读一遍
 
 
 def get_text_info(root, log=None, force=False, src_lang="auto"):
@@ -1148,8 +1172,9 @@ def patch_installed(root):
 
 
 def is_done(t, done):
-    """翻过、而且译文能安全放进游戏的才算翻完（旧版本存下的标签坏掉的译文会重翻）"""
-    return t in done and valid_translation(t, done[t])
+    """翻过、译文能安全放进游戏、而且真的翻出来了才算翻完
+    （旧版本存下的标签坏掉的译文、原样返回的外文句子会重翻）"""
+    return t in done and valid_translation(t, done[t]) and not looks_untranslated(t, done[t])
 
 
 def game_status(root, log=None, src_lang="auto"):
@@ -1253,9 +1278,13 @@ SYSTEM_PROMPT = """你是资深游戏本地化译者，负责把视觉小说/游
 3. 原文里的换行照样保留。
 4. 译文要像中文游戏里角色自然说出来的话：口语化，保留原文的语气、情绪和粗口程度，不要书面腔，不要加任何解释、注释或括号说明。
 5. 人名、地名用常见音译并前后保持一致；界面按钮类短词（如 Start、Load、Yes、Preferences）用中文游戏里的常见说法。
-6. 原文已经是中文、或者只是符号/代码/文件名的，原样返回。
-7. 用户可能附带「前文」和「说话人」：只用来理解语境（谁在说、对谁说、男女、关系、语气），让译文和前文连贯、人称和称呼对得上。前文不用翻译，也不要出现在输出里。
+6. 原文已经是中文、或者只是符号/代码/文件名的，原样返回。其他句子都必须真的翻成中文，不能把外文原样抄回来。
+7. 用户可能附带「前文」「后文」和「说话人」：只用来理解语境（谁在说、对谁说、男女、关系、语气），让译文和前后文连贯、人称和称呼对得上。前文、后文不用翻译，也不要出现在输出里。
 8. 有「名词表」的话，表里的译名必须照用，整部游戏保持一致。
+9. 按前后文和说话人判断 he/she/they/you 指谁：他/她/他们/她们分清楚，不确定时宁可用名字或省略，也不要乱猜。第二人称一般用「你」，只有对长辈、上级或正式场合才用「您」，同一对角色之间的称呼前后一致。
+10. 说话人是「（选项）」的是玩家可以点的选项：译得简短直接，像中文游戏里的选项，不加句号。
+11. 标点用中文全角（，。？！：；“”），省略号写成「……」，破折号写成「——」；方括号、花括号里的内容不受这条影响。语气词和拟声词（Hmm、Ugh、Ah、Haha）用自然的中文（嗯、呃、啊、哈哈），不要音译。
+12. 俚语、双关、玩笑：意译成中文里效果相近的说法，不要逐字直译。
 只输出 JSON，不要输出任何其他内容。"""
 
 
@@ -1351,6 +1380,11 @@ class ApiResponseError(RuntimeError):
     pass
 
 
+class ApiRequestError(RuntimeError):
+    """请求参数或接口不受支持，拆小批次也不会解决。"""
+    pass
+
+
 def _ssl_context():
     try:
         import certifi
@@ -1417,7 +1451,10 @@ def call_api(cfg, messages, usage):
     if url.lower().startswith("https"):
         kw["context"] = SSL_CTX
     with urllib.request.urlopen(req, **kw) as r:
-        resp = json.loads(r.read().decode("utf-8"))
+        try:
+            resp = json.loads(r.read().decode("utf-8"))
+        except (ValueError, UnicodeError) as e:
+            raise ApiResponseError("接口没有返回有效的 UTF-8 JSON，请检查接口地址和服务状态") from e
     if not isinstance(resp, dict):
         raise ApiResponseError("接口返回的不是 JSON 对象：%s" % str(resp)[:200])
     usage.add(cfg, resp.get("usage"))  # 到这一步已经计费了，先记上
@@ -1466,7 +1503,11 @@ def call_with_retry(cfg, messages, usage, stop, tries=4):
             if e.code == 400 and "model" in low and not re.search(r"context|length|token", low):
                 raise AuthError("模型名不对（HTTP 400）%s" % detail)
             if e.code in (400, 413, 422):
-                raise RuntimeError("HTTP %d %s" % (e.code, detail))
+                if e.code == 413 or re.search(r"context|length|token|too (?:large|long)", low):
+                    raise RuntimeError("HTTP %d %s" % (e.code, detail))
+                raise ApiRequestError("HTTP %d %s" % (e.code, detail))
+            if e.code != 429 and not 500 <= e.code < 600:
+                raise ApiRequestError("HTTP %d %s" % (e.code, detail))
             last = "HTTP %d %s" % (e.code, detail)
             if e.code == 429:
                 try:
@@ -1513,8 +1554,10 @@ def system_prompt(cfg, game_glossary=None):
 
 def source_language_rule(cfg):
     return {
-        "ja": "\n原文是日语：纯汉字的日文也必须翻成简体中文，不要当作已经是中文（如「開始」→「开始」）。",
+        "ja": "\n原文是日语：纯汉字的日文也必须翻成简体中文，不要当作已经是中文（如「開始」→「开始」）。"
+              "译文里不能留下平假名、片假名。さん、くん、ちゃん、先輩、様这类称呼按语境译成中文里自然的说法（如「学长」「小～」），同一个人前后一致。",
         "zh-TW": "\n原文是繁体中文：必须转成简体中文，不能因为原文是中文就原样返回。",
+        "ko": "\n原文是韩语：译文里不能留下韩文字母。",
     }.get(cfg.get("renpy_from_lang"), "")
 
 
@@ -1522,35 +1565,88 @@ GLOSSARY_PROMPT = """你是资深游戏本地化译者。用户会发来一个�
 请给每个名字定一个简体中文译名，返回 JSON 对象 {原名: 译名}。
 人名用常见、简短自然的音译；有含义的称号或绰号按意思译；已经是中文的原样返回；看不出是什么的代号、缩写保留原文。只输出 JSON。"""
 
+TERMS_PROMPT = """
+另外还会附带「候选词」：游戏台词里反复出现、首字母大写的词。其中真正的专有名词（地名、组织、学校、店名、物品、技能、头衔、昵称等）也给出固定的简体中文译名，放进同一个 JSON 对象；
+只是普通单词、感叹词、句首大写，或者不需要固定译法的，值写 null。"""
 
-def ensure_glossary(cfg, root, names, usage, stop, log):
-    """翻译前先把角色名定下来，整部游戏统一用；结果存在工具的 data 文件夹，可以手动改"""
+# 句中大写但不是专有名词的常见词
+_TERM_STOP = set("""I I'm I'll I've I'd Mr Mrs Ms Dr Miss Sir Madam Ma'am Oh OK Okay Hey Yes No
+Monday Tuesday Wednesday Thursday Friday Saturday Sunday January February March April May June July
+August September October November December English""".split())
+_TERM_RE = re.compile(r"(?<=[a-z0-9,;] )([A-Z][a-z]+(?:[ -][A-Z][a-z]+)*)(?![a-z]|['’][A-Z])")
+
+
+def find_terms(texts, names=(), limit=60, speakers=None):
+    """台词里反复出现、在句中也大写、从来没以小写出现过的词，多半是地名/组织/物品名。
+    交给模型定一个固定译名，免得不同批次译法不一样。只对拉丁字母的原文有用。
+    有说话人信息时只看台词和选项，界面文字（Window Mode 这种）的大写不算"""
+    mid, lower = Counter(), set()
+    for t in texts:
+        if len(t) > 2000 or (speakers and t not in speakers):
+            continue
+        bare = TOKEN_RE.sub(" ", t)
+        mid.update(_TERM_RE.findall(bare))
+        lower.update(re.findall(r"\b[a-z][a-z]+\b", bare))
+    known = set()
+    for n in names or ():
+        known.add(n)
+        known.update(n.split())
+    out = []
+    for term, n in mid.most_common():
+        if n < 3 or term in known or term in _TERM_STOP:
+            continue
+        if any(w.lower() in lower or w in _TERM_STOP for w in re.split(r"[ -]", term)):
+            continue
+        out.append(term)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def ensure_glossary(cfg, root, names, usage, stop, log, terms=()):
+    """翻译前先把角色名和反复出现的专有名词定下来，整部游戏统一用；结果存在工具的 data 文件夹，可以手动改"""
     gl = load_glossary(root)
+    skip_path = _data_path(root, "glossary_skip")
+    skipped = set(read_json_soft(skip_path, []) or [])
     missing = [n for n in names if n not in gl][:200]
-    if not missing:
+    new_terms = [t for t in terms if t not in gl and t not in skipped and t not in missing][:60]
+    if not missing and not new_terms:
         return gl
     wait_if_paused(stop)
     c = dict(cfg)
     c["json_mode"] = True
-    msgs = [{"role": "system", "content": GLOSSARY_PROMPT + source_language_rule(cfg)},
-            {"role": "user", "content": json.dumps(missing, ensure_ascii=False)}]
+    sysp = GLOSSARY_PROMPT + (TERMS_PROMPT if new_terms else "") + source_language_rule(cfg)
+    user = json.dumps(missing, ensure_ascii=False)
+    if new_terms:
+        user += "\n\n候选词：" + json.dumps(new_terms, ensure_ascii=False)
+    msgs = [{"role": "system", "content": sysp},
+            {"role": "user", "content": user}]
     try:
         obj = parse_reply(call_with_retry(c, msgs, usage, stop))
-    except (AuthError, StopRequested, ApiResponseError):
+    except (AuthError, StopRequested, ApiResponseError, ApiRequestError):
         raise
     except Exception as e:
         log("  定角色译名失败（%s），这次先不用名词表" % str(e)[:80])
         return gl
-    added = 0
+    added = terms_added = 0
     if isinstance(obj, dict):
-        for n in missing:
+        for n in missing + new_terms:
             v = obj.get(n)
             if isinstance(v, str) and v.strip() and not TOKEN_RE.search(v):
                 gl[n] = v.strip()
-                added += 1
+                if n in missing:
+                    added += 1
+                else:
+                    terms_added += 1
+            elif n in new_terms and n in obj:
+                skipped.add(n)  # 模型说不是专有名词：记下来，下次不再问
     write_json(glossary_path(root), gl, indent=1)
+    if new_terms:
+        write_json(skip_path, sorted(skipped), indent=1)
     if added:
         log("  定好了 %d 个角色名的译名（名词表），整部游戏统一用" % added)
+    if terms_added:
+        log("  定好了 %d 个反复出现的专有名词的译名（名词表）" % terms_added)
     return gl
 
 
@@ -1560,12 +1656,14 @@ def _restore_spaces(orig, trans):
     return lead + trans.strip() + trail
 
 
-def translate_batch(cfg, sp, texts, usage, stop, ctx=None, speakers=None):
+def translate_batch(cfg, sp, texts, usage, stop, ctx=None, speakers=None, after=None):
     wait_if_paused(stop)
     payload = {str(i + 1): t for i, t in enumerate(texts)}
     parts = []
     if ctx:
         parts.append("前文（只作参考，不用翻译，也不要输出）：\n" + "\n".join(ctx))
+    if after:
+        parts.append("后文（只作参考，不用翻译，也不要输出）：\n" + "\n".join(after))
     spk = {str(i + 1): speakers[t] for i, t in enumerate(texts) if speakers and speakers.get(t)}
     if spk:
         parts.append("说话人（编号: 角色）：" + json.dumps(spk, ensure_ascii=False))
@@ -1588,7 +1686,7 @@ def translate_batch(cfg, sp, texts, usage, stop, ctx=None, speakers=None):
     out = {}
     for i, t in enumerate(texts):
         v = obj.get(str(i + 1))
-        if isinstance(v, str) and valid_translation(t, v):
+        if isinstance(v, str) and valid_translation(t, v) and not looks_untranslated(t, v):
             out[t] = _restore_spaces(t, v)
     return out
 
@@ -1665,7 +1763,8 @@ def translate_game(cfg, root, usage, stop, log, progress):
     gl = {}
     left_all = [t for t in texts if not is_done(t, done)]
     if use_ctx and left_all:
-        gl = ensure_glossary(cfg, root, info.get("names") or [], usage, stop, log)
+        names = info.get("names") or []
+        gl = ensure_glossary(cfg, root, names, usage, stop, log, terms=find_terms(texts, names, speakers=speakers))
         # 角色名本身（比如名字框里显示的）直接用名词表，不用再翻
         pre = {t: gl[t] for t in left_all if t in gl and valid_translation(t, gl[t])}
         if pre:
@@ -1673,7 +1772,7 @@ def translate_game(cfg, root, usage, stop, log, progress):
             left_all = [t for t in left_all if t not in pre]
     bad_old = sum(1 for t in left_all if t in done)
     if bad_old:
-        log("  有 %d 条旧译文的变量/标签对不上（放进游戏可能报错），这次重翻" % bad_old)
+        log("  有 %d 条旧译文变量/标签对不上（放进游戏可能报错）或者根本没翻出来，这次重翻" % bad_old)
     with _INFLIGHT_LOCK:
         busy = set(t for g, t in INFLIGHT_TEXTS if g == gid)  # 只看同一个游戏的
     todo = [t for t in left_all if t not in busy]
@@ -1686,29 +1785,48 @@ def translate_game(cfg, root, usage, stop, log, progress):
         return state["n"], total, 0, stats["chars"]
     sp = system_prompt(cfg, gl)
 
+    # 有说话人信息的游戏，语境只取台词和选项：夹在中间的界面文字（按钮、设置项）只会干扰
+    dialogue_only = bool(speakers)
+
+    def _nearby(start, step, count):
+        lines, i, scanned = [], start, 0
+        while 0 <= i < len(texts) and len(lines) < count and scanned < count * 8:
+            t = texts[i]
+            i += step
+            scanned += 1
+            if len(t) > 300 or (dialogue_only and t not in speakers):
+                continue
+            lines.append(t)
+        return lines if step > 0 else lines[::-1]
+
+    def _ctx_line(t, with_tr):
+        who = speakers.get(t)
+        line = ("%s：" % who if who else "") + t
+        tr = done.get(t) if with_tr else None
+        if tr and is_done(t, done):
+            line += "  →  " + tr
+        return line
+
     def context_for(batch):
         if not use_ctx:
             return None
         i0 = index.get(batch[0], 0)
-        lines = []
-        for t in texts[max(0, i0 - 6):i0]:
-            if len(t) > 300:
-                continue
-            who = speakers.get(t)
-            line = ("%s：" % who if who else "") + t
-            tr = done.get(t)
-            if tr:
-                line += "  →  " + tr
-            lines.append(line)
-        return lines
+        return [_ctx_line(t, True) for t in _nearby(i0 - 1, -1, 8)]
+
+    def after_for(batch):
+        if not use_ctx:
+            return None
+        i1 = index.get(batch[-1], len(texts) - 1)
+        return [_ctx_line(t, False) for t in _nearby(i1 + 1, 1, 3)]
 
     def run_round(items, size, max_chars):
         failed = []
         if not items:
             return failed
-        ex = ThreadPoolExecutor(max_workers=max(1, int(cfg.get("threads", 4))))
+        workers = max(1, int(cfg.get("threads", 4)))
+        ex = ThreadPoolExecutor(max_workers=workers)
 
-        def job(b, ctx):
+        def job(b, ctx, after):
             while not send_ok.wait(0.2):
                 if stop.is_set():
                     raise StopRequested()
@@ -1716,19 +1834,25 @@ def translate_game(cfg, root, usage, stop, log, progress):
                 raise StopRequested()
             with _INFLIGHT_LOCK:  # 从这里开始算「在路上」，一直到结果存好（见 release）
                 INFLIGHT_TEXTS.update((gid, t) for t in b)
-            return translate_batch(cfg, sp, b, usage, stop, ctx, speakers if use_ctx else None)
+            return translate_batch(cfg, sp, b, usage, stop, ctx, speakers if use_ctx else None, after)
 
         def release(b):
             with _INFLIGHT_LOCK:
                 INFLIGHT_TEXTS.difference_update((gid, t) for t in b)
 
+        # 只保留正在处理的批次。下一批等结果存好后再提交，语境也在这时生成。
+        # 大游戏不会创建成千上万个 Future，停止/接口拒绝后也没有长队继续发请求。
         futs = {}
-        for b in _batches(items, size, max_chars):
-            futs[ex.submit(job, b, context_for(b))] = b
-        pending = set(futs)
-        processed = set()
+        batches = iter(_batches(items, size, max_chars))
 
-        def late(fut):
+        def submit_next():
+            if stop.is_set():
+                return
+            b = next(batches, None)
+            if b is not None:
+                futs[ex.submit(job, b, context_for(b), after_for(b))] = b
+
+        def late(fut, b):
             # 停止后才回来的请求：结果照样存下来，不浪费（存不进去的留在内存里，下次开始前补存）
             try:
                 if not fut.cancelled() and fut.exception() is None:
@@ -1736,21 +1860,22 @@ def translate_game(cfg, root, usage, stop, log, progress):
             except Exception:
                 pass
             finally:
-                release(futs[fut])
+                release(b)
 
         try:
-            while pending:
+            for _ in range(workers):
+                submit_next()
+            while futs:
                 if stop.is_set():
                     raise StopRequested()
-                finished, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+                finished, _ = wait(futs, timeout=0.3, return_when=FIRST_COMPLETED)
                 fatal = None
                 for fut in finished:
-                    processed.add(fut)
-                    b = futs[fut]
+                    b = futs.pop(fut)
                     try:
                         try:
                             res = fut.result()
-                        except (AuthError, StopRequested, ApiResponseError) as e:
+                        except (AuthError, StopRequested, ApiResponseError, ApiRequestError) as e:
                             # 返回格式不对：拆小批次、逐句再试也只会一样，多试就是多花钱，直接停
                             fatal = fatal or e
                             continue
@@ -1766,15 +1891,15 @@ def translate_game(cfg, root, usage, stop, log, progress):
                     progress(state["n"], total)
                 if fatal is not None:
                     raise fatal
+                for _ in finished:
+                    submit_next()
         except BaseException:
             # 不管是停止、key 不对，还是写盘失败：排队的请求全部取消，不再花钱；
             # 已经发出去的回来后照样存（同一轮里已回来、还没处理的也一样）
             stop.set()
-            for f in futs:
-                if f in processed:
-                    continue
+            for f, b in list(futs.items()):
                 if not f.cancel():
-                    f.add_done_callback(late)
+                    f.add_done_callback(lambda fut, batch=b: late(fut, batch))
             ex.shutdown(wait=False)
             raise
         ex.shutdown(wait=True)
